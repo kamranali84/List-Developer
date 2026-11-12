@@ -18,6 +18,7 @@ import datetime
 import io
 import collections
 import difflib
+import functools
 import json
 import math
 import os
@@ -184,6 +185,118 @@ LIST_NAMES = ["Valve List", "Equipment List", "Line List", "Instrument List", "T
 HIDE_BY_DEFAULT = {"Prefix", "Number", "Suffix", "Context", "Valve Code", "Plant Unit", "System Code", "Sheet No"}
 BASE_KEYS = {"Category", "Tag", "Source", "Loc", "Context"}
 
+# ---- valve type / operator / end connection / material read from description text -------------
+# (regular expressions on UPPER-CASE text; the first matching rule wins, so specific ones come first)
+VALVE_TYPE_KW = [
+    (r"BALL\s*CHECK", "Ball Check Valve"),
+    (r"KNIFE\s*GATE|\bKGV\b", "Knife Gate Valve"),
+    (r"BUTTER\s*FLY|\bBFV\b|\bBFLY\b", "Butterfly Valve"),
+    (r"\bBALL\b", "Ball Valve"),
+    (r"\bGATE\b", "Gate Valve"),
+    (r"\bGLOBE\b", "Globe Valve"),
+    (r"\bCHECK\s*VALVE\b|VALVE\W*CHECK\b|NON[\s-]*RETURN|SWING\s*CHECK|\bNRV\b|WAFER\s*CHECK|DUAL\s*PLATE|\bLIFT\s*CHECK", "Check Valve"),
+    (r"\bPLUG\b", "Plug Valve"),
+    (r"\bNEEDLE\b", "Needle Valve"),
+    (r"DIAPHRAGM", "Diaphragm Valve"),
+    (r"\bPINCH\b", "Pinch Valve"),
+    (r"3[\s-]*WAY|THREE[\s-]*WAY|\bDIVERTER\b", "3-Way Valve"),
+    (r"SAFETY\s*RELIEF|PRESSURE\s*RELIEF|RELIEF\s*VALVE|\bPSV\b|\bPRV\b|\bSRV\b", "Pressure Relief Valve"),
+    (r"ANGLE\s*(?:SEAT|VALVE|TYPE)", "Angle Seat Valve"),
+    (r"FLOAT\s*(?:TYPE|VALVE)", "Float Valve"),
+    (r"ROOT\s*(?:ISOLATION|VALVE)", "Root Isolation Valve"),
+    (r"DOUBLE\s*BLOCK|\bDBB\b", "Double Block & Bleed Valve"),
+    (r"AIR\s*RELEASE|VACUUM\s*BREAKER", "Air Release Valve"),
+    (r"CONTROL\s*VALVE", "Control Valve"),
+    (r"SOLENOID\s*VALVE", "Solenoid Valve"),
+]
+VALVE_OPR_KW = [
+    (r"MAN\s*OPR|MANUAL|HAND\s*WHEEL|HANDWHEEL|HAND\s*LEVER|LEVER\s*OPERATED|GEAR\s*OPERATED", "Manual"),
+    (r"AIR\s*CYLINDER|PNEUMATIC|AIR\s*ACTUAT|DOUBLE\s*ACTING|SPRING\s*RETURN|\bAC\b", "Air cylinder operated"),
+    (r"MOTOR\s*OPERATED|\bMOV\b|ELECTRIC\s*ACTUAT|MOTORI[SZ]ED", "Motor operated"),
+    (r"SOLENOID|\bSAV\b", "Solenoid-operated"),
+    (r"LIMIT\s*SWITCH|\bLSO\b|\bLS\b", "Limit switches"),
+]
+VALVE_END_KW = [
+    (r"WAFER", "Wafer"), (r"\bLUG\b", "Lug"), (r"FLANGED|\bFLG\b", "Flanged"),
+    (r"THREADED|SCREWED|\bNPT\b|\bTHRD\b", "Threaded"), (r"SOCKET\s*WELD", "Socket Weld"),
+    (r"BUTT\s*WELD", "Butt Weld"), (r"TRI[\s-]*CLAMP", "Tri-clamp"), (r"GROOVED", "Grooved"),
+]
+VALVE_MAT_KW = [
+    (r"\bSS\s?316L?\b|\b316L?\s?SS\b|\bSS316L?\b", "SS316"), (r"\bSS\s?304L?\b|\bSS304L?\b", "SS304"),
+    (r"STAINLESS", "Stainless Steel"), (r"CARBON\s*STEEL|\bCS\b", "Carbon Steel"), (r"\bCPVC\b", "CPVC"),
+    (r"\bPVC\b|\bUPVC\b", "PVC"), (r"\bPVDF\b", "PVDF"), (r"\bHDPE\b", "HDPE"),
+    (r"DUCTILE\s*IRON", "Ductile Iron"), (r"CAST\s*IRON", "Cast Iron"), (r"\bBRONZE\b", "Bronze"),
+    (r"\bBRASS\b", "Brass"), (r"RUBBER\s*LINED", "Rubber Lined"),
+]
+_VT_RX = [(re.compile(p), n) for p, n in VALVE_TYPE_KW]
+_OPR_RX = [(re.compile(p), n) for p, n in VALVE_OPR_KW]
+_END_RX = [(re.compile(p), n) for p, n in VALVE_END_KW]
+_MAT_RX = [(re.compile(p), n) for p, n in VALVE_MAT_KW]
+
+
+@functools.lru_cache(maxsize=8)
+def _custom_vt_rules(custom):
+    """'KGV=Knife Gate Valve' lines typed in Settings -> compiled rules (checked before the built-in ones)"""
+    out = []
+    for ln in (custom or "").splitlines():
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            if k.strip() and v.strip():
+                out.append((re.compile(r"(?<![A-Z0-9])" + re.escape(k.strip().upper()) + r"(?![A-Z0-9])"), v.strip()))
+    return out
+
+
+def detect_valve_type(text):
+    """'8" BUTTERFLY VALVE, WAFER' -> 'Butterfly Valve';  '' when the text names no valve type."""
+    t = normalise(text or "")
+    custom = _custom_vt_rules(st.session_state.get("pid_vkw", ""))
+    for rx, name in list(custom) + _VT_RX:
+        if rx.search(t):
+            return name
+    return ""
+
+
+def detect_valve_attrs(text):
+    """type / operator / end connection / body material found in a piece of description text"""
+    t = normalise(text or "")
+    first = lambda rules: next((n for rx, n in rules if rx.search(t)), "")
+    return dict(type=detect_valve_type(t), end=first(_END_RX), mat=first(_MAT_RX),
+                opr=", ".join(n for rx, n in _OPR_RX if rx.search(t)))
+
+
+def merge_opr(*parts):
+    seen, out = set(), []
+    for p in parts:
+        for x in str(p or "").split(","):
+            x = x.strip()
+            if x and x.lower() not in seen:
+                seen.add(x.lower())
+                out.append(x)
+    return ", ".join(out)
+
+
+SELF_OPERATED_TYPES = {"Check Valve", "Ball Check Valve", "Pressure Relief Valve", "Air Release Valve"}
+_SIZE_TXT = re.compile(r'(?<![A-Z0-9/.-])(\d{1,2}(?:-\d/\d)?|\d/\d)\s*(?:"|IN\b|INCH\b)')
+
+
+def type_operator(vtype, fn, acc=()):
+    """default operator from the valve type read from the description, else from the tag code"""
+    if vtype in SELF_OPERATED_TYPES:
+        return "Self-operated"
+    return operator_of(fn, list(acc))
+
+
+def size_in_text(text):
+    m = _SIZE_TXT.search(normalise(text or ""))
+    return (m.group(1) + '"') if m else ""
+
+
+def build_valve_desc(size, vtype, end="", opr="", mat=""):
+    """e.g.  8" Butterfly Valve, Wafer, SS316, Manual"""
+    size = "" if str(size).strip() in ("", '"') else str(size).strip()
+    head = f"{size} {vtype}".strip()
+    return ", ".join(x for x in (head, end, mat, opr) if x)
+
 
 # =============================================================================
 #  SESSION DEFAULTS
@@ -223,10 +336,12 @@ def _init_state():
     ss.setdefault("pid_right", 10)
     ss.setdefault("pid_svc", PID_DEFAULT_SVC)
     ss.setdefault("pid_vmap", "")
+    ss.setdefault("pid_vkw", "")
     ss.setdefault("prefix_hints", [])
     ss.setdefault("fmtbook", None)       # active customer Excel format workbook
     ss.setdefault("final_fmt", {})
     ss.setdefault("final_grp", {})
+    ss.setdefault("skid_replications", [])
 
 
 _init_state()
@@ -523,10 +638,16 @@ def on_pipe(pp, c, perp_max, ext=20):
     return None
 
 
+SYSTEM_NAMES = [(r"\bULTRAFILTRATION\b|\bULTRAFILTER\b", "UF"), (r"\bREVERSE\s+OSMOSIS\b|\bRO\s+SKID\b", "RO"), (r"\bNANOFILTRATION\b", "NF"), (r"\bMICROFILTRATION\b", "MF"), (r"\bELECTRODEIONIZATION\b|\bEDI\b", "EDI"), (r"\bZERO\s+LIQUID\s+DISCHARGE\b|\bZLD\b", "ZLD")]
+def system_name_from_text(text):
+    t = normalise(str(text or ""))
+    return next((name for pat, name in SYSTEM_NAMES if re.search(pat, t, re.I)), "")
+
 def parse_page(page, svc_words, right_pct=10, bottom_pct=4):
     s = page.width / 3024.0
     all_items = build_items(page)
     W, H = page.width, page.height
+    page_system = system_name_from_text(" ".join(i["text"] for i in all_items))
     prefix_hints = sorted({i["text"] for i in all_items if re.fullmatch(r"[A-Z]{2,4}\d{2,4}-", i["text"])})
     dc = [(i["size"], i["cy"] + i["cx"], m.group(0)) for i in all_items for m in DWG_FIND.finditer(i["text"])]
     dwg = max(dc)[2] if dc else ""
@@ -600,8 +721,9 @@ def parse_page(page, svc_words, right_pct=10, bottom_pct=4):
         m = SIZE_ONLY.match(tx) or LINE_LABEL.match(tx)
         if m:
             sizes.append((it["cx"], it["cy"], m.group("size").replace(" ", "") + '"', tx))
-        if tx in FAIL:
-            fcs.append((it["cx"], it["cy"], FAIL[tx]))
+        fk = re.sub(r"[^A-Z]", "", tx.upper())
+        fm = dict(FAIL, FAILCLOSED="Fail Closed", FAILOPEN="Fail Open", FAILLAST="Fail Last")
+        if fk in fm: fcs.append((it["cx"], it["cy"], fm[fk]))
     blocks_ = merge_blocks(items)
     for b in blocks_:
         if NOTE_REF.search(b["text"]) or "MANIFOLD" in b["text"]:
@@ -615,16 +737,61 @@ def parse_page(page, svc_words, right_pct=10, bottom_pct=4):
             if True:
                 svcs.append((x, y, c))
     pipes = build_pipes(page, s, right_pct)
+
+    # Vector-symbol recognition. In the supplied legend a BALL VALVE is the
+    # bow-tie valve symbol with a distinct circle at its centre. Detect that
+    # small circle only when it lies directly on a process pipe, which avoids
+    # confusing instrument bubbles with valve symbols.
+    symbol_balls = []
+    for c in page.curves:
+        w, h = c.get("width", 0), c.get("height", 0)
+        if not (2.5 * s <= w <= 36 * s and 2.5 * s <= h <= 36 * s and abs(w - h) <= 5 * s):
+            continue
+        cp = ((c["x0"] + c["x1"]) / 2, (c["top"] + c["bottom"]) / 2)
+        pp_ = pipe_for(pipes, cp, s)
+        if pp_ and ((pp_["o"] == "H" and abs(cp[1] - pp_["c"]) <= 6 * s) or
+                    (pp_["o"] == "V" and abs(cp[0] - pp_["c"]) <= 6 * s)):
+            symbol_balls.append(cp)
+
+    def symbol_valve_type(u):
+        p0 = u.get("tag_pos", u["pos"])
+        near = [q for q in symbol_balls if _dist(p0, q) <= 220 * s]
+        return ("Ball Valve", "P&ID ball-valve symbol (centre circle)") if near else ("", "")
+
     vals = [u for u in uniq.values() if u["fn"] in VALVE_FN and u["n"] > 0]
     for u in vals:
-        u["pos"] = u["real"][0]; u["fail"] = ""
+        u["pos"] = u["real"][0]; u["tag_pos"] = u["real"][0]; u["fail"] = ""
     elig = [u for u in vals if u["fn"] in ACTUATED]
     pairs = sorted((_dist(u["pos"], (f[0], f[1])), i, j) for i, u in enumerate(elig) for j, f in enumerate(fcs))
     ua, fa = set(), set()
     for d, i, j in pairs:
-        if d <= 300 * s and i not in ua and j not in fa:
+        if d <= 450 * s and i not in ua and j not in fa:
             ua.add(i); fa.add(j)
-            elig[i]["pos"] = (fcs[j][0], fcs[j][1]); elig[i]["fail"] = fcs[j][2]
+            elig[i]["fail"] = fcs[j][2]
+    type_labels = []                                      # text on the drawing that names a valve type
+    for b in blocks_:
+        a_ = detect_valve_attrs(b["text"])
+        if a_["type"]:
+            type_labels.append((b["cx"], b["cy"], a_))
+    for it in items:
+        if it["rot"]:
+            a_ = detect_valve_attrs(it["text"])
+            if a_["type"]:
+                type_labels.append((it["cx"], it["cy"], a_))
+
+    def schedule_attrs(u):
+        """tag and description on the same row (valve schedule / legend table)"""
+        rx_ = re.compile(r"(?<![A-Z0-9])" + re.escape(u["fn"]) + r"[\s-]*" + re.escape(u["num"]) + r"(?![A-Z0-9])")
+        for it in items:
+            if it["rot"] or not rx_.search(it["text"]):
+                continue
+            row = [o for o in items if not o["rot"] and abs(o["cy"] - it["cy"]) <= max(3, 0.5 * it["size"])
+                   and abs(o["cx"] - it["cx"]) <= 700 * s]
+            a_ = detect_valve_attrs(" ".join(o["text"] for o in sorted(row, key=lambda o: o["x0"])))
+            if a_["type"]:
+                return a_
+        return None
+
     rows = []
     for u in vals:
         p = u["pos"]
@@ -665,8 +832,21 @@ def parse_page(page, svc_words, right_pct=10, bottom_pct=4):
         acc = sorted({o["fn"] for o in uniq.values() if o["pre"] == u["pre"] and o["num"] == u["num"]
                       and o["fn"] != u["fn"] and o["n"] > 0 and (o["fn"] not in VALVE_FN or o["fn"] == "SV")}
                      ) if u["fn"] in ACTUATED else []
+        va, vsrc = schedule_attrs(u), "valve schedule / same-row text"
+        if not va and type_labels:
+            z = min(type_labels, key=lambda z: _dist(p, (z[0], z[1])))
+            if _dist(p, (z[0], z[1])) <= 150 * s:
+                va, vsrc = z[2], "label near valve - verify"
+        va = va or {}
+        sym_type, sym_src = symbol_valve_type(u)
+        if sym_type:
+            va = dict(va)
+            va["type"] = sym_type
+            vsrc = sym_src
         rows.append(dict(pre=u["pre"], fn=u["fn"], num=u["num"], pos=p, fail=u["fail"], acc=acc, size=size,
-                         size_src=size_src, svc=svc, note=note, pipe=bool(pp), count=u["n"]))
+                         size_src=size_src, svc=svc, note=note, pipe=bool(pp), count=u["n"],
+                         vtype=va.get("type", ""), vsrc=vsrc if va.get("type") else "", opr_txt=va.get("opr", ""),
+                         endc=va.get("end", ""), mat=va.get("mat", "")))
     others = [u for u in uniq.values() if u["fn"] not in VALVE_FN and u["n"] > 0]
     return rows, others, prefix_hints, dwg
 
@@ -895,7 +1075,7 @@ def parse_valve_desc(desc):
         return None
     body = re.sub(r"^VALVE\W*", "", d)
     typ = body.split(",")[0].strip()
-    typ = BOM_TYPE.get(typ, typ.title()) + " Valve"
+    typ = detect_valve_type(d) or (BOM_TYPE.get(typ, typ.title()) + " Valve")
     m = re.search(r"(\d+(?:-\d/\d|/\d+)?)\s*\"", d) or re.search(r",\s*(\d+(?:/\d+)?)\b", d)
     size = (m.group(1) + '"') if m else ""
     rest = d[m.end():] if m else ""
@@ -1220,6 +1400,17 @@ def pid_extract(name, data, cfg, log, status=None):
     vmap = dict(VALVE_MAP)
     vmap.update(cfg["valve_map"])
     rows, hints, notes = [], set(), []
+    # Drawing-wide system name. Page-local extraction can miss the title block,
+    # so use the complete PDF text and file name as a fallback.
+    document_system = system_name_from_text(name)
+    try:
+        if fitz:
+            _sd = fitz.open(stream=data, filetype="pdf")
+            _all_pdf_text = " ".join(pg.get_text("text") or "" for pg in _sd)
+            document_system = system_name_from_text(_all_pdf_text) or document_system
+            _sd.close()
+    except Exception:
+        pass
     tess_ready()                                 # sets the Tesseract path (typed or auto-detected)
 
     def tag_of(pre, fn, num):
@@ -1240,19 +1431,23 @@ def pid_extract(name, data, cfg, log, status=None):
                 extra_instr.append(dict(pre=r["pre"], fn="SV", num=r["num"], pos=r["pos"]))
                 continue
             vtype = r.get("vtype") or vmap.get(r["fn"], r["fn"] or "Valve")
+            tsrc = r.get("vsrc") or ("BOM description" if (r.get("vtype") and "item" in r) else "tag code only - verify")
             if r["note"]:
-                vtype = r["note"]
+                vtype, tsrc = r["note"], "drawing note"
             tag = full(r["tag"]) if r.get("tag") else tag_of(r["pre"], r["fn"], r["num"])
-            opr = r["operator"] if "operator" in r else operator_of(r["fn"], r["acc"])
+            opr = r["operator"] if "operator" in r else type_operator(vtype, r["fn"], r["acc"])
+            opr = merge_opr(r.get("opr_txt", ""), opr)
             extra = {}
             if "item" in r:
                 extra = {"BOM Item": r["item"], "BOM Description": r["bom"], "Reading Check": r["conf"]}
             rows.append(dict(base, Category="Valve", Tag=tag, Type=vtype,
-                             Description=(r["size"] + " " if r["size"] else "") + vtype +
+                             Description=build_valve_desc(r["size"], vtype, r.get("endc", ""), opr, r.get("mat", "")) +
                              (", " + r["fail"] if r["fail"] else ""),
                              Operator=opr,
-                             **{"Valve Size": r["size"], "Service": r["svc"], "Fail Position": r["fail"],
-                                "Accessories": ", ".join(r["acc"]), "Size Source": r["size_src"]}, **extra,
+                             **{"Valve Size": r["size"], "Service": r["svc"], "System Name": r.get("system", "") or document_system, "Fail Position": r["fail"],
+                                "Accessories": ", ".join(r["acc"]), "Size Source": r["size_src"],
+                                "End Connection": r.get("endc", ""), "Body Material": r.get("mat", ""),
+                                "Type Source": tsrc}, **extra,
                              Prefix=r["fn"], Number=n, Suffix=sfx,
                              Context=f'x={int(r["pos"][0])}, y={int(r["pos"][1])} pt'))
         for o in others + extra_instr:
@@ -1369,6 +1564,12 @@ def scan_blocks(blocks):
         def ctx(m):
             return t[max(0, m.start() - 35): m.end() + 35].replace("\n", " ").strip()
 
+        def lctx(m, w=70):                      # same line, up to w characters either side of the tag
+            a = t.rfind("\n", 0, m.start()) + 1
+            b = t.find("\n", m.end())
+            b = len(t) if b < 0 else b
+            return t[max(a, m.start() - w): min(b, m.end() + w)]
+
         base = dict(Source=src, Loc=loc)
         line_pos = []
         # ---- lines
@@ -1399,8 +1600,15 @@ def scan_blocks(blocks):
             g = m.groupdict()
             claimed.append(m.span())
             n, sz, sp = nearest(m.start())
+            va = detect_valve_attrs(lctx(m))
+            vt_ = va["type"] or VALVE_MAP.get(g["type"], g["type"])
+            opr_ = merge_opr(va["opr"], type_operator(va["type"], g["type"]))
+            vsz = size_in_text(lctx(m))                      # size written in the valve's own description
             rows.append(dict(base, Category="Valve", Tag=f'{g["type"]}-{g["num"]}{g.get("sfx") or ""}',
-                             Type=VALVE_MAP.get(g["type"], g["type"]), Prefix=g["type"], Number=g["num"],
+                             Type=vt_, Description=build_valve_desc(vsz, vt_, va["end"], opr_, va["mat"]),
+                             Operator=opr_, **{"Valve Size": vsz, "End Connection": va["end"], "Body Material": va["mat"],
+                                               "Type Source": "description text" if va["type"] else "tag code only - verify"},
+                             Prefix=g["type"], Number=g["num"],
                              Suffix=g.get("sfx") or "", **{"Nearest Line No": n, "Size (from line)": sz,
                                                            "Piping Spec (from line)": sp}, Context=ctx(m)))
         # ---- equipment
@@ -1471,9 +1679,332 @@ def aggregate(raw, category, tag_label):
 
 
 
+# =============================================================================
+#  VALVE OUTPUT ENRICHMENT + REPEATED SKID REPLICATION
+# =============================================================================
+def valve_type_display(value):
+    """Customer-facing type: Ball Type, Butterfly Type, Check Type, etc."""
+    t = str(value or "").strip()
+    u = t.upper()
+    aliases = [
+        ("BUTTERFLY", "Butterfly Type"), ("BALL", "Ball Type"),
+        ("CHECK", "Check Type"), ("NON-RETURN", "Check Type"), ("NON RETURN", "Check Type"),
+        ("KNIFE GATE", "Knife Gate Type"), ("GATE", "Gate Type"),
+        ("GLOBE", "Globe Type"), ("NEEDLE", "Needle Type"),
+        ("PLUG", "Plug Type"), ("DIAPHRAGM", "Diaphragm Type"),
+        ("PINCH", "Pinch Type"), ("PRESSURE RELIEF", "Pressure Relief Type"),
+        ("PRESSURE SAFETY", "Pressure Safety Type"), ("SAFETY RELIEF", "Safety Relief Type"),
+        ("FLOW CONTROL", "Flow Control Type"), ("PRESSURE CONTROL", "Pressure Control Type"),
+        ("LEVEL CONTROL", "Level Control Type"), ("TEMPERATURE CONTROL", "Temperature Control Type"),
+        ("SOLENOID", "Solenoid Type"),
+    ]
+    for key, label in aliases:
+        if key in u:
+            return label
+    # VL/HV describe operation, not valve construction. Never publish them as valve type.
+    if u in ("VL", "HV", "MANUAL", "MANUAL VALVE", "VALVE", ""):
+        return "Type to Verify"
+    return t.replace(" Valve", "").strip() + " Type" if not u.endswith(" TYPE") else t
+
+
+def valve_name_from_display(display):
+    d = str(display or "").strip()
+    return "Valve" if d == "Type to Verify" else re.sub(r"\s+Type$", " Valve", d, flags=re.I)
+
+
+def enrich_valve_output(v):
+    """Fill Valve Type and Description from BOM/description/context/tag code."""
+    if v is None or v.empty:
+        return v
+    v = v.copy()
+    for c in ("Valve Type", "Description", "Operator", "Valve Size", "End Connection", "Body Material", "System Name"):
+        if c not in v.columns:
+            v[c] = ""
+    for i, r in v.iterrows():
+        evidence = " ".join(str(r.get(c, "") or "") for c in
+                            ("BOM Description", "Description", "Context", "Valve Type"))
+        attrs = detect_valve_attrs(evidence)
+        code = str(r.get("Prefix", "") or r.get("Valve Code", "")).upper()
+        raw_type = attrs["type"] or str(r.get("Valve Type", "")).strip()
+        # Function codes are useful only when they identify construction/function.
+        if not raw_type or raw_type.upper() in ("VL", "HV", "MANUAL VALVE", "VALVE"):
+            raw_type = {"BV":"Ball Valve", "GV":"Gate Valve", "GLV":"Globe Valve",
+                        "CHV":"Check Valve", "NRV":"Check Valve", "CV":"Check Valve",
+                        "FCV":"Flow Control Valve", "PCV":"Pressure Control Valve",
+                        "LCV":"Level Control Valve", "TCV":"Temperature Control Valve",
+                        "PSV":"Pressure Safety Valve", "PRV":"Pressure Relief Valve"}.get(code, "")
+        vtype = valve_type_display(raw_type)
+        size = str(r.get("Valve Size", "")).strip() or size_in_text(evidence)
+        opr = merge_opr(attrs["opr"], r.get("Operator", ""), type_operator(vtype, code))
+        endc = str(r.get("End Connection", "")).strip() or attrs["end"]
+        mat = str(r.get("Body Material", "")).strip() or attrs["mat"]
+        fail = str(r.get("Fail Position", "")).strip()
+        v.at[i, "Valve Type"] = vtype
+        v.at[i, "Valve Size"] = size
+        v.at[i, "Operator"] = opr
+        v.at[i, "End Connection"] = endc
+        v.at[i, "Body Material"] = mat
+        desc_type = valve_name_from_display(vtype)
+        system = str(r.get("System Name", "") or "").strip()
+        v.at[i, "Description"] = ((system + " ") if system else "") + build_valve_desc(size, desc_type, endc, opr, mat) + ((", " + fail) if fail else "")
+    return v
+
+
+def detect_skid_replications(blocks):
+    """Detect explicit notes such as 'Skids B & C not shown - same as Skid A'."""
+    found = []
+    for src, loc, text in blocks:
+        t = re.sub(r"\s+", " ", normalise(text))
+        patterns = [
+            r"SKIDS?\s+(?P<targets>[A-Z](?:\s*(?:,|&|AND|/)\s*(?:SKIDS?\s*)?[A-Z])+)"
+            r".{0,160}?(?:NOT\s+SHOWN|SAME\s+AS|IDENTICAL\s+TO|SIMILAR\s+TO|TYPICAL\s+OF)"
+            r".{0,80}?SKID\s+(?P<source>[A-Z])\b",
+            r"SKID\s+(?P<source>[A-Z])\b.{0,160}?(?:TYPICAL\s+FOR|SAME\s+FOR|APPLICABLE\s+TO)"
+            r".{0,80}?SKIDS?\s+(?P<targets>[A-Z](?:\s*(?:,|&|AND|/)\s*(?:SKIDS?\s*)?[A-Z])+)",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, t, re.I):
+                source = m.group("source").upper()
+                targets = [x for x in re.findall(r"\b[A-Z]\b", m.group("targets").upper()) if x != source]
+                targets = list(dict.fromkeys(targets))
+                if targets:
+                    found.append(dict(file=src, location=loc, source=source, targets=targets,
+                                      evidence=m.group(0).strip()))
+    # Common P&ID layout: SKID A is shown, while SKID B (NOT SHOWN) and
+    # SKID C (NOT SHOWN) are listed with the same model/modules/capacity.
+    # The suffix convention in this drawing is ...6100A / ...6100B / ...6100C.
+    for src, loc, text in blocks:
+        t = re.sub(r"\s+", " ", normalise(text))
+        shown = [x for x in re.findall(r"(?:ULTRAFILTER\s+)?SKID\s+([A-Z])", t)
+                 if not re.search(rf"SKID\s+{x}\s*\(\s*NOT\s+SHOWN\s*\)", t)]
+        hidden = re.findall(r"(?:ULTRAFILTER\s+)?SKID\s+([A-Z])\s*\(\s*NOT\s+SHOWN\s*\)", t)
+        if shown and hidden:
+            source = shown[0]
+            targets = [x for x in dict.fromkeys(hidden) if x != source]
+            if targets:
+                found.append(dict(file=src, location=loc, source=source, targets=targets,
+                                  suffix_mode=True, evidence=f"Skid {source} shown; " +
+                                  ", ".join(f"Skid {x} NOT SHOWN" for x in targets)))
+
+    # Document-wide fallback. PDF extractors sometimes split the three skid
+    # headings into separate text blocks. Combine all blocks per file so Skid C
+    # is not missed when its heading is extracted away from Skid A.
+    by_file = collections.defaultdict(list)
+    for src, loc, text in blocks:
+        by_file[src].append(normalise(text))
+    for src, parts in by_file.items():
+        t = re.sub(r"\s+", " ", " ".join(parts))
+        hidden = []
+        for letter in re.findall(r"SKID\s*[- ]?([A-Z])", t, re.I):
+            if re.search(rf"SKID\s*[- ]?{letter}\b.{{0,50}}?NOT\s*SHOWN", t, re.I):
+                hidden.append(letter.upper())
+        hidden = list(dict.fromkeys(hidden))
+        all_skids = [x.upper() for x in re.findall(r"SKID\s*[- ]?([A-Z])", t, re.I)]
+        shown = [x for x in dict.fromkeys(all_skids) if x not in hidden]
+        if shown and hidden:
+            found.append(dict(file=src, location="document", source=shown[0], targets=hidden,
+                              suffix_mode=True, evidence=f"Skid {shown[0]} shown; " +
+                              ", ".join(f"Skid {x} NOT SHOWN" for x in hidden)))
+
+    # Merge all instructions for the same file/source. This guarantees that
+    # separately detected B and C targets are both replicated.
+    merged = {}
+    for x in found:
+        key = (x["file"], x["source"])
+        if key not in merged:
+            merged[key] = dict(x, targets=[])
+        merged[key]["targets"] = list(dict.fromkeys(merged[key]["targets"] + x["targets"]))
+        if x.get("evidence") and x["evidence"] not in merged[key].get("evidence", ""):
+            merged[key]["evidence"] = (merged[key].get("evidence", "") + "; " + x["evidence"]).strip("; ")
+    return list(merged.values())
+
+
+def _replace_skid_token(value, source, target):
+    """Replace only controlled skid markers, never ordinary letters inside words."""
+    if value is None:
+        return value
+    x = str(value)
+    rules = [
+        (rf"(?i)(\bSKID\s*[- ]?){source}(\b)", rf"\g<1>{target}\g<2>"),
+        (rf"(?i)(\bSK\s*[- ]?){source}(\b)", rf"\g<1>{target}\g<2>"),
+        (rf"(?i)(\bSK){source}(?=-)", rf"\g<1>{target}"),
+        (rf"(?i)(\bSKID\s+){source}(\b)", rf"\g<1>{target}\g<2>"),
+    ]
+    for pat, repl in rules:
+        x = re.sub(pat, repl, x)
+    # Controlled equipment/tag suffix: NB-VL-6100A -> NB-VL-6100B/C.
+    # A letter is changed only when it immediately follows 2-6 digits.
+    x = re.sub(rf"(?i)(?<=\d){source}(?=\b)", target, x)
+    return x
+
+
+def _row_is_source_skid(row, source):
+    text = " ".join(str(row.get(c, "") or "") for c in
+                    ("Tag", "Description", "Context", "P&ID Number", "Source", "Loc"))
+    return bool(re.search(rf"(?i)\b(?:SKID\s*[- ]?|SK\s*[- ]?){source}\b|\bSK{source}-|\d{2,6}{source}\b", text))
+
+
+def replicate_skid_data(raw, instructions):
+    """Clone the COMPLETE shown Skid-A dataset to Skids B and C.
+
+    All Valve, Instrument and Equipment rows whose tag ends in A are copied.
+    Existing B/C rows are retained and missing rows are added. This is applied
+    to the raw extraction table before Valve/Instrument/Equipment lists are built.
+    """
+    if raw is None or raw.empty or not instructions or "Tag" not in raw.columns:
+        return raw
+    out = raw.copy()
+    for c in ("Replication Source", "Reading Check"):
+        if c not in out.columns:
+            out[c] = ""
+
+    # Merge targets globally. The drawing explicitly shows A and identifies B/C
+    # as the repeated skids, even when PDF text extraction separates the notes.
+    targets = []
+    evidence = []
+    for ins in instructions:
+        targets.extend(ins.get("targets", []))
+        if ins.get("evidence"):
+            evidence.append(ins["evidence"])
+    targets = list(dict.fromkeys(x.upper() for x in targets if x.upper() != "A"))
+    if not targets:
+        return out
+
+    # Complete source population: every extracted valve, instrument and equipment
+    # tag ending A, including formats NB-VL-6100A and NB ZSO 6101A.
+    tags = out["Tag"].astype(str).str.strip()
+    category_ok = out["Category"].astype(str).isin(["Valve", "Instrument", "Equipment"])
+    source_mask = category_ok & tags.str.contains(r"\d{2,6}A$", case=False, regex=True, na=False)
+    source_rows = out[source_mask].copy()
+    if source_rows.empty:
+        return out
+
+    existing = set(tags.str.upper())
+    additions = []
+    replace_cols = {
+        "Tag", "Description", "Context", "P&ID Number", "Service",
+        "Associated Valve", "Nearest Line No", "BOM Description"
+    }
+    note = "; ".join(dict.fromkeys(evidence))
+
+    for target in targets:
+        for _, r in source_rows.iterrows():
+            nr = r.copy()
+            for c in replace_cols & set(out.columns):
+                nr[c] = _replace_skid_token(nr.get(c, ""), "A", target)
+            new_tag = str(nr.get("Tag", "")).strip().upper()
+            if not new_tag or new_tag == str(r.get("Tag", "")).strip().upper():
+                continue
+            if new_tag in existing:
+                continue
+            nr["Replication Source"] = f"Complete Skid A copy to Skid {target}"
+            nr["Reading Check"] = f"Generated from repeated-skid note; verify against P&ID. {note}"
+            additions.append(nr)
+            existing.add(new_tag)
+
+    if additions:
+        out = pd.concat([out, pd.DataFrame(additions)], ignore_index=True)
+    return out
+
+
 # ---- derived valve fields (paste above build_lists) --------------------------
 TAG_PARSE = re.compile(r'^(?:(?P<unit>[A-Z]{2,4}\d{2,4})-)?(?:(?P<sys>[A-Z]{2,3})-)?(?P<fn>[A-Z]{2,4})-?'
                        r'(?P<num>\d{2,5})(?P<sfx>[A-Z]?)$')
+
+
+def add_customer_valve_fields(v):
+    """Create customer description from area/system + skid + actual valve duty/type."""
+    if v is None or v.empty:
+        return v
+    v = v.copy()
+    fields = ("Valve Description with area description", "Service Description", "Equip Code",
+              "Operator Type", "Fail Mod", "IO Type", "Vendor P&ID No")
+    for c in fields:
+        if c not in v.columns: v[c] = ""
+
+    system_long = {"UF":"ULTRAFILTER", "RO":"REVERSE OSMOSIS", "NF":"NANOFILTRATION",
+                   "MF":"MICROFILTRATION", "EDI":"ELECTRODEIONIZATION", "ZLD":"ZLD",
+                   "DM":"DEMINERALIZATION", "WWTP":"WASTEWATER TREATMENT"}
+    code_duty = {"PV":"BACKPRESSURE", "SRV":"SAFETY RELIEF", "PSV":"SAFETY RELIEF",
+                 "PRV":"PRESSURE RELIEF", "SV":"SOLENOID", "SOV":"SOLENOID",
+                 "FCV":"FLOW CONTROL", "PCV":"PRESSURE CONTROL", "LCV":"LEVEL CONTROL",
+                 "TCV":"TEMPERATURE CONTROL", "NRV":"CHECK", "CHV":"CHECK"}
+    code_type = {"PV":"BALL", "SRV":"SAFETY RELIEF", "PSV":"SAFETY RELIEF",
+                 "PRV":"PRESSURE RELIEF", "SV":"SOLENOID", "SOV":"SOLENOID",
+                 "NRV":"CHECK", "CHV":"CHECK", "BV":"BALL", "GV":"GATE",
+                 "GLV":"GLOBE", "FCV":"FLOW CONTROL", "PCV":"PRESSURE CONTROL",
+                 "LCV":"LEVEL CONTROL", "TCV":"TEMPERATURE CONTROL"}
+
+    for i, r in v.iterrows():
+        tag = str(r.get("Tag No", "")).upper().strip()
+        code = str(r.get("Valve Code", "") or r.get("Prefix", "")).upper().strip()
+        suffix = str(r.get("Suffix", "") or "").upper().strip()
+        system = str(r.get("System Name", "") or "").upper().strip()
+        size = str(r.get("Valve Size", "") or "").strip()
+        extracted_type = str(r.get("Valve Type", "") or "").upper().replace(" TYPE", "").replace(" VALVE", "").strip()
+        service = str(r.get("Service", "") or "").upper().strip()
+        operator_raw = str(r.get("Operator", "") or "").upper()
+        fail_raw = str(r.get("Fail Position", "") or "").upper()
+
+        if not suffix:
+            m = re.search(r"(\d{2,6})([ABC])$", tag)
+            suffix = m.group(2) if m else ""
+        area = system_long.get(system, system)
+        # Full system/skid name required by the customer format. UF/RO/NF/MF
+        # equipment is described as a skid even when the individual tag has no
+        # A/B/C suffix. A/B/C is appended only when present in the tag.
+        skid_systems = {"UF", "RO", "NF", "MF"}
+        if system in skid_systems:
+            area_with_skid = f"{area} SKID" + (f" {suffix}" if suffix in "ABC" else "")
+        else:
+            area_with_skid = area + (f" SKID {suffix}" if suffix in "ABC" else "")
+        area_with_skid = area_with_skid.strip()
+
+        valve_type = extracted_type if extracted_type not in ("", "TYPE TO VERIFY", "VALVE", "MANUAL") else code_type.get(code, "VALVE")
+        duty = code_duty.get(code, "")
+        # Prefer a meaningful P&ID service/duty, but ignore generic abbreviations.
+        # Code-defined valve duty has priority. Proximity text marked
+        # 'nearest - verify' must never replace BACKPRESSURE/SAFETY RELIEF/etc.
+        if (not duty and service and service not in ("NB", "N/A", code, valve_type)
+                and "NEAREST" not in service and "VERIFY" not in service):
+            duty = service
+        service_desc = " ".join(x for x in (area_with_skid, duty, "VALVE") if x).strip()
+        service_desc = re.sub(r"\bVALVE\s+VALVE\b", "VALVE", service_desc)
+
+        if code in ("SRV", "PSV", "PRV") or "RELIEF" in valve_type:
+            operator = "SPRING"
+        elif code in ("SV", "SOV") or "SOLENOID" in valve_type:
+            operator = "SOLENOID"
+        elif "PNEUMATIC" in operator_raw or "AIR" in operator_raw:
+            operator = "PNEUMATIC"
+        elif "MOTOR" in operator_raw or code == "MOV":
+            operator = "ELECTRIC"
+        elif "MANUAL" in operator_raw:
+            operator = "MANUAL"
+        else:
+            operator = operator_raw
+
+        fail = {"FAIL CLOSED":"FC", "FAIL OPEN":"FO", "FAIL LAST":"FL"}.get(fail_raw, fail_raw)
+        io_type = "DIGITAL" if code in ("SV", "SOV", "XV", "MOV", "SDV", "ESDV") else "N/A"
+        engineering_desc = " ".join(x for x in (size, valve_type.title(), "Valve") if x).strip()
+        if operator in ("SPRING", "SOLENOID", "PNEUMATIC", "ELECTRIC"):
+            engineering_desc += ", " + ("Self-operated" if operator == "SPRING" else operator.title())
+
+        # Customer format has only one Description column. Write the complete
+        # area/system/skid duty description directly into that existing column.
+        v.at[i, "Description"] = service_desc
+        v.at[i, "Valve Description with area description"] = service_desc
+        v.at[i, "Service Description"] = service_desc
+        if "Technical Description" not in v.columns:
+            v["Technical Description"] = ""
+        v.at[i, "Technical Description"] = engineering_desc
+        v.at[i, "Equip Code"] = code
+        v.at[i, "Valve Type"] = valve_type
+        v.at[i, "Operator Type"] = operator
+        v.at[i, "Fail Mod"] = fail
+        v.at[i, "IO Type"] = io_type
+        v.at[i, "Vendor P&ID No"] = str(r.get("P&ID Number", "") or "")
+    return v
 
 
 def add_valve_fields(v):
@@ -1499,9 +2030,24 @@ def build_lists(raw):
     if not v.empty:
         v = v.rename(columns={"Type": "Valve Type"})
         v = add_valve_fields(v)
-        pref = ["Tag No", "P&ID Number", "Description", "Valve Type", "Valve Size", "Service", "Operator",
+        v = enrich_valve_output(v)
+        v = add_customer_valve_fields(v)
+        pref = ["Tag No", "Description", "Plant Unit", "System Code", "Equip Code", "Number", "Suffix",
+                "Valve Size", "Valve Type", "Operator Type", "Fail Mod", "IO Type", "Vendor P&ID No",
+                "P&ID Number", "System Name", "Description", "Type Source", "End Connection",
+                "Body Material", "Valve Size", "Service", "Operator",
                 "Fail Position", "Accessories", "BOM Item", "BOM Description", "Size Source", "Reading Check"]
-        v = v[[c for c in pref if c in v.columns] + [c for c in v.columns if c not in pref]]
+        # Keep each field only once. Some preferred fields can accidentally be
+        # repeated while the customer output layout is customized (for example
+        # Valve Size), which Streamlit data_editor does not allow.
+        ordered = []
+        for c in pref + list(v.columns):
+            if c in v.columns and c not in ordered:
+                ordered.append(c)
+        v = v.loc[:, ordered]
+        # Defensive cleanup for any duplicate labels already present in the
+        # DataFrame (keep the first populated/extracted column).
+        v = v.loc[:, ~v.columns.duplicated(keep="first")]
     L["Valve List"] = v
     L["Equipment List"] = aggregate(raw, "Equipment", "Tag No")
     L["Line List"] = aggregate(raw, "Line", "Line No")
@@ -1626,18 +2172,22 @@ PRESETS = [dict(
     signature={"valve mark", "vendor p&id no", "plant unit", "system code"},
     cols={
         "Tag Name": ("Tag No", ""),
-        "P&ID Description": ("Service", ""),
+        "P&ID Description": ("Description", ""),
         "Valve Mark": ("(blank)", "--"),
         "Plant Unit": ("Plant Unit", ""),
         "System Code": ("System Code", ""),
         "Size": ("Valve Size", ""),
         "Number": ("Number", ""),
         "Suffix": ("Suffix", ""),
-        "Valve Type": ("Valve Code", ""),
+        "Valve Type": ("Valve Type", ""),
+        "Equip Code": ("Equip Code", ""),
+        "Operator Type": ("Operator Type", ""),
+        "Fail Mod": ("Fail Mod", ""),
+        "IO Type": ("IO Type", ""),
         "Insulation Type": ("(blank)", ""),
-        "End Connection": ("(blank)", ""),
+        "End Connection": ("End Connection", ""),
         "Rating": ("(blank)", ""),
-        "Body Material": ("(blank)", ""),
+        "Body Material": ("Body Material", ""),
         "Manufacturer": ("(blank)", ""),
         "Model Number": ("(blank)", ""),
         "Design Pressure [PSIG]": ("(blank)", ""),
@@ -1790,6 +2340,17 @@ def apply_format(df, fmt, mapdf):
             h += " "
         used.add(h)
         tgt = m["Map to field"]
+        # Upgrade old saved customer mappings: the customer column "Valve Type"
+        # must contain Ball Type / Butterfly Type / Check Type, never VL/BV/etc.
+        if _hkey(h) == "valve type" and tgt == "Valve Code" and "Valve Type" in df.columns:
+            tgt = "Valve Type"
+        forced = {"description":"Description", "valve description":"Description",
+                  "valve description with area description":"Description",
+                  "service description":"Description", "p&id description":"Description",
+                  "equip code":"Equip Code", "operator type":"Operator Type", "fail mod":"Fail Mod",
+                  "io type":"IO Type", "vendor p&id no":"Vendor P&ID No"}
+        if _hkey(h) in forced and forced[_hkey(h)] in df.columns:
+            tgt = forced[_hkey(h)]
         fx = "" if (not has_fx or _isblank(m["Fixed value"])) else _num(m["Fixed value"])
         if tgt == "(S.No)":
             out[h] = list(range(1, len(df) + 1))
@@ -2176,7 +2737,7 @@ def current_style():
 # =============================================================================
 #  PROFILE (customer format) SAVE / LOAD
 # =============================================================================
-PID_KEYS = ("pid_on", "pid_prefix", "pid_sv", "pid_right", "pid_svc", "pid_vmap", "pid_ocr", "pid_ocr_text", "pid_tess")
+PID_KEYS = ("pid_on", "pid_prefix", "pid_sv", "pid_right", "pid_svc", "pid_vmap", "pid_ocr", "pid_ocr_text", "pid_tess", "pid_vkw")
 BOOL_KEYS = {"sno", "pid_on", "pid_sv", "pid_ocr", "pid_ocr_text"}
 INT_KEYS = {"font", "pid_right"}
 
@@ -2318,6 +2879,18 @@ with st.sidebar:
         else:
             with st.spinner("Reading documents (P&ID geometry reading can take a few seconds per sheet)..."):
                 blocks, log = read_files(files, use_ocr)
+                skid_replications = detect_skid_replications(blocks)
+                # Robust repeated-skid fallback for this P&ID convention. If the
+                # same document contains SKID A, SKID B and SKID C headings, and
+                # A-suffix process tags are present, clone the complete A dataset
+                # to both B and C. This does not depend on all three headings being
+                # extracted into the same PDF text block.
+                _all_text = normalise(" ".join(b[2] for b in blocks))
+                _skid_letters = set(re.findall(r"(?:ULTRAFILTER\s+)?SKID\s*[- ]?([ABC])\b", _all_text))
+                if {"A", "B", "C"} <= _skid_letters:
+                    skid_replications.append(dict(file="P&ID", location="document", source="A",
+                                                  targets=["B", "C"], suffix_mode=True,
+                                                  evidence="Skid A shown; Skid B and Skid C repeated/not shown"))
                 raw = scan_blocks(blocks)
                 spatial_rows, spatial_src, hints = [], set(), set()
                 if st.session_state["pid_on"]:
@@ -2335,9 +2908,25 @@ with st.sidebar:
                         drop = raw["Category"].isin(["Valve", "Instrument", "Equipment"]) & raw["Source"].isin(spatial_src)
                         raw = raw[~drop]
                     raw = pd.concat([raw, pd.DataFrame(spatial_rows)], ignore_index=True)
+                if skid_replications:
+                    raw = replicate_skid_data(raw, skid_replications)
+                    _tags = raw.get("Tag", pd.Series(dtype=str)).astype(str)
+                    _cats = raw.get("Category", pd.Series(dtype=str)).astype(str)
+                    for _letter in ("A", "B", "C"):
+                        _mask = _tags.str.contains(rf"\d{{2,6}}{_letter}$", case=False, regex=True, na=False)
+                        _summary = _cats[_mask].value_counts().to_dict()
+                        log.append(("P&ID", f"Skid {_letter} completeness", int(_mask.sum()),
+                                    f"Valve={_summary.get('Valve',0)}, Instrument={_summary.get('Instrument',0)}, "
+                                    f"Equipment={_summary.get('Equipment',0)}"))
+                    for _sr in skid_replications:
+                        log.append((_sr["file"], "Skid replication", 0,
+                                    f"Copied Skid {_sr['source']} to " +
+                                    ", ".join("Skid " + x for x in _sr["targets"]) +
+                                    "; generated rows require verification."))
             if st.session_state["pid_on"]:
                 _ph.empty()
             st.session_state.update(raw=raw, log=log, lists=build_lists(raw), prefix_hints=sorted(hints),
+                                    skid_replications=skid_replications,
                                     run_id=st.session_state["run_id"] + 1, pdf_bytes={})
             st.success(f"Done: {len(raw)} raw matches found.")
             for _l in log:
@@ -2410,6 +2999,9 @@ def render_list(name):
         return
     extras = s["extras"].get(name, [])
     df_full = base.copy()
+    # st.data_editor requires unique column labels. Preserve the first column
+    # when an uploaded template/profile or customized list contains duplicates.
+    df_full = df_full.loc[:, ~df_full.columns.duplicated(keep="first")]
     for e in extras:
         if e not in df_full.columns:
             df_full[e] = ""
@@ -2534,6 +3126,9 @@ with tabs[7]:
     st.text_area("Service keywords (comma separated) - labels containing these words are treated as line service",
                  key="pid_svc", height=110)
     st.text_area("Valve code → type override (one per line, e.g. VL=Ball Valve)", key="pid_vmap", height=90)
+    st.text_area("Valve type keywords (one per line, e.g. KGV=Knife Gate Valve). Text near a valve / in its description "
+                 "that contains the keyword sets the valve type (butterfly, ball, check, gate, globe ... are built in)",
+                 key="pid_vkw", height=90)
     st.slider("Ignore right-hand strip of sheet (% width) - title block / notes", 0, 30, key="pid_right")
     st.text_input("Tesseract OCR path (only if not found automatically, e.g. C:\\Program Files\\Tesseract-OCR\\tesseract.exe)",
                   key="pid_tess")
@@ -2572,9 +3167,9 @@ with tabs[0]:
                        unsafe_allow_html=True)
         st.write("")
         g1, g2 = st.columns(2)
-        if "Valve List" in L and "Type" in L["Valve List"]:
+        if "Valve List" in L and "Valve Type" in L["Valve List"]:
             g1.markdown("**Valves by type**")
-            g1.bar_chart(L["Valve List"]["Type"].value_counts())
+            g1.bar_chart(L["Valve List"]["Valve Type"].value_counts())
         if "Instrument List" in L and "Measured Variable" in L["Instrument List"]:
             g2.markdown("**Instruments by measured variable**")
             g2.bar_chart(L["Instrument List"]["Measured Variable"].value_counts())
