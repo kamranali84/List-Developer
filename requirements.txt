@@ -1,0 +1,14 @@
+streamlit
+pandas
+openpyxl==3.1.5
+reportlab
+PyMuPDF
+pypdf
+pdfplumber
+python-docx
+ezdxf
+xlrd
+pytesseract
+Pillow
+pypdfium2
+numpy
